@@ -82,6 +82,23 @@ def get_img(project_id: int, img_type: str):
 
 # ===============================================================================================================================================================================================================
 # 2) 배너 생성 API
+# 배너 생성 API 호출 예시 
+#js 호출
+# const fd = new FormData();
+# fd.append("headline", headline); 
+# fd.append("typo_text", typoText);
+# await fetch(`/ai/${projectId}/banner`, {
+#     method: "POST",
+#     body: fd
+# });
+
+#curl 방식
+
+#curl -X POST "http://localhost:8000/ai/{project_id}/banner" \
+#     -F "headline=맛있는 간식" \
+#     -F "typo_text=손이가요 손이가." \
+#     --output banner_result.png
+
 # ===============================================================================================================================================================================================================
 class BannerRequest(BaseModel):
     headline: str = Field(..., example="맛있는 간식")
