@@ -285,13 +285,14 @@ def create_sns_image(project_id: int, req: SNSGenRequest):
 
 
 
+
 # ===============================================================================================================================================================================================================
 # 6) 패키지 이미지 생성 API
 # ===============================================================================================================================================================================================================
 # curl 호출 예시:
 # curl -X POST "http://localhost:8000/ai/{project_id}/package" \
 #    -H "Content-Type: multipart/form-data" \
-#    -F "instruction=Make it pop!" \
+#    -F "instruction=Make it pop! (Optional)" \
 #    -F "dieline_file=@box_dieline.png" \
 #    -F "concept_file=@shrimp_cracker_concept.png" \
 #    --output package_result.png
@@ -300,29 +301,32 @@ def create_sns_image(project_id: int, req: SNSGenRequest):
 #    - dieline_file (File): 박스 전개도 이미지.
 #    - concept_file (File): 디자인 레퍼런스 이미지. 
 #
-# 처리 과정 (Logic):
-#    1. 구조 분석: OpenCV로 전개도의 윤곽선을 따서 메인/사이드/상단 패널 좌표(x,y,w,h) 자동 추출
-#    2. 배경 생성: 컨셉 이미지의 주조색을 추출하여 자연스러운 종이 질감(Coated Cardboard) 배경 생성
-#    3. 디자인 생성: Gemini가 각 패널(앞면: 씨즐/로고, 옆면: 정보, 윗면: 가로형 로고)에 맞는 2D 그래픽 생성
-#    4. 최종 합성: 생성된 이미지를 마스킹하여 전개도에 입히고(Masking), 원본 라인을 선명하게 복원(Multiply)
+# 선택 INPUT:
+#    - instruction (str): 추가 수정 요청사항 (값이 있으면 생성 후 자동 수정 진행)
+#
+# 처리 과정:
+#    1. 전개도 구조 분석 (OpenCV 기반 패널 좌표 추출)
+#    2. 컨셉 이미지 분석 및 배경 텍스처 생성
+#    3. 각 패널(메인/사이드/상단)별 디자인 렌더링 (Gemini Pro Vision)
+#    4. 최종 합성 및 리터칭 (Dieline 복원)
 #
 # 응답 형식:
-#   - image/png (최종 생성된 패키지 디자인)
+#   - image/png
 # ===============================================================================================================================================================================================================
 @app.post("/ai/{project_id}/package")
 async def create_package_with_gemini(
     project_id: int,
+    instruction: str = Form(""),
     dieline_file: UploadFile = File(...),
     concept_file: UploadFile = File(...),
 ):
     # 1. 파일 검증
     if not dieline_file.content_type.startswith("image/") or not concept_file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="only image upload allowed")
+        raise HTTPException(status_code=400, detail="Only image files are allowed.")
 
     product_dir = ensure_product_dir(project_id)
 
-    # 2. 업로드 원본 저장
-    # (PackageGenerator 내부 로직에서 이 파일명들을 참조함)
+    # 2. 파일 저장 
     dieline_path = product_dir / "dieline_input.png"
     concept_path = product_dir / "concept_input.png"
 
@@ -332,39 +336,56 @@ async def create_package_with_gemini(
     with concept_path.open("wb") as buffer:
         shutil.copyfileobj(concept_file.file, buffer)
 
-    # 3. 결과 저장 경로
-    output_path = product_dir / "package.png"
+    # 3. 결과물 경로 설정
+    generated_temp_path = Path("FINAL_RESULT4.png")
+    final_output_path = product_dir / "package.png"
 
-    # 4. Gemini 호출
+    # 4. 생성 파이프라인 실행 (GeminiPlease.py)
     try:
-        generator = PackageGenerator(api_key=API_KEY)
-        generator.edit_package_image(
-            product_dir=str(product_dir),
+        import GeminiPlease
+        
+        # 스크립트 실행 (절대경로 전달)
+        GeminiPlease.run_final_natural_pipeline(
+            str(dieline_path.resolve()), 
+            str(concept_path.resolve())
         )
+        
+        # 결과 파일 이동
+        if generated_temp_path.exists():
+            shutil.move(str(generated_temp_path), str(final_output_path))
+        else:
+            raise FileNotFoundError("Generation script finished but no output found.")
 
     except Exception as e:
-        print(f"Error generation package: {e}")
-        raise HTTPException(status_code=500, detail=f"package generation failed: {e}")
+        print(f"Generation Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-    # 5. 생성된 이미지 반환
-    return FileResponse(output_path, media_type="image/png", filename="package.png")
+    # 5. (옵션) 추가 수정 요청이 있는 경우 (package_generate.py)
+    if instruction and instruction.strip():
+        try:
+            # 모듈 import
+            from package_generate import PackageGenerator
+            
+            # 생성된 파일을 edit 입력용으로 복사
+            edit_input_path = product_dir / "package_input.png"
+            shutil.copy(final_output_path, edit_input_path)
+            
+            # 수정 실행
+            generator = PackageGenerator(api_key=API_KEY)
+            edited_path_str = generator.edit_package_image(
+                product_dir=product_dir, 
+                instruction=instruction
+            )
+            
+            if edited_path_str:
+                final_output_path = Path(edited_path_str)
+                
+        except Exception as e:
+            # 수정 실패 시 로그만 남기고, 생성된 원본 반환
+            print(f"Warning: Edit step failed ({e}). Returning original generation.")
 
-
-class PackageGenerator:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        # self.client = genai.Client(api_key=self.api_key)
-        pass
-
-    def edit_package_image(self, product_dir: str):
-        """
-        [Main Logic] 전개도(dieline_input.png)와 컨셉(concept_input.png)을 사용하여 패키지 디자인을 생성합니다.
-        
-        Args:
-            product_dir (str): 파일들이 저장된 프로젝트 디렉토리 경로. 
-            내부에 'dieline_input.png'와 'concept_input.png'가 있어야 함.
-        """
-        pass
+    # 6. 결과 반환
+    return FileResponse(final_output_path, media_type="image/png", filename="package.png")
 
 @app.get("/hello")
 def hello():
